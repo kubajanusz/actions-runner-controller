@@ -156,7 +156,12 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	ephemeralRunnerState := newEphemeralRunnerState(ephemeralRunnerList)
+	ephemeralRunnerState, invalidPatchIDs := newEphemeralRunnerState(ephemeralRunnerList)
+
+	// Log any invalid PatchIDs found
+	for _, invalidPatchID := range invalidPatchIDs {
+		log.Info("Found invalid PatchID annotation", "warning", invalidPatchID)
+	}
 
 	log.Info("Ephemeral runner counts",
 		"pending", len(ephemeralRunnerState.pending),
@@ -164,6 +169,7 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 		"finished", len(ephemeralRunnerState.finished),
 		"failed", len(ephemeralRunnerState.failed),
 		"deleting", len(ephemeralRunnerState.deleting),
+		"latestPatchID", ephemeralRunnerState.latestPatchID,
 	)
 
 	if r.PublishMetrics {
@@ -190,7 +196,17 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	total := ephemeralRunnerState.scaleTotal()
-	if ephemeralRunnerSet.Spec.PatchID == 0 || ephemeralRunnerSet.Spec.PatchID != ephemeralRunnerState.latestPatchID {
+	// Enhanced PatchID checking to handle edge cases better
+	shouldProcess := ephemeralRunnerSet.Spec.PatchID == 0 || ephemeralRunnerSet.Spec.PatchID != ephemeralRunnerState.latestPatchID
+	
+	log.Info("PatchID comparison",
+		"specPatchID", ephemeralRunnerSet.Spec.PatchID,
+		"latestPatchID", ephemeralRunnerState.latestPatchID,
+		"shouldProcess", shouldProcess,
+		"current", total,
+		"desired", ephemeralRunnerSet.Spec.Replicas)
+	
+	if shouldProcess {
 		defer func() {
 			if err := r.cleanupFinishedEphemeralRunners(ctx, ephemeralRunnerState.finished, log); err != nil {
 				log.Error(err, "failed to cleanup finished ephemeral runners")
@@ -211,6 +227,10 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 			// request is issued, we should ignore the scale down request.
 			// Eventually, the ephemeral runner will be cleaned up on the next patch request, which happens
 			// on the next batch
+			log.Info("Scale down request received but ignored due to PatchID > 0", 
+				"patchID", ephemeralRunnerSet.Spec.PatchID,
+				"current", total, 
+				"desired", ephemeralRunnerSet.Spec.Replicas)
 		case ephemeralRunnerSet.Spec.PatchID == 0 && total > ephemeralRunnerSet.Spec.Replicas:
 			count := total - ephemeralRunnerSet.Spec.Replicas
 			log.Info("Deleting ephemeral runners (scale down)", "count", count)
@@ -225,6 +245,11 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 				log.Error(err, "failed to delete idle runners")
 				return ctrl.Result{}, err
 			}
+		default:
+			log.Info("No scaling action needed",
+				"patchID", ephemeralRunnerSet.Spec.PatchID,
+				"current", total,
+				"desired", ephemeralRunnerSet.Spec.Replicas)
 		}
 	}
 
@@ -301,7 +326,7 @@ func (r *EphemeralRunnerSetReconciler) cleanUpEphemeralRunners(ctx context.Conte
 		return true, nil
 	}
 
-	ephemeralRunnerState := newEphemeralRunnerState(ephemeralRunnerList)
+	ephemeralRunnerState, _ := newEphemeralRunnerState(ephemeralRunnerList)
 
 	log.Info("Clean up runner counts",
 		"pending", len(ephemeralRunnerState.pending),
@@ -565,14 +590,20 @@ type ephemeralRunnerState struct {
 	latestPatchID int
 }
 
-func newEphemeralRunnerState(ephemeralRunnerList *v1alpha1.EphemeralRunnerList) *ephemeralRunnerState {
+func newEphemeralRunnerState(ephemeralRunnerList *v1alpha1.EphemeralRunnerList) (*ephemeralRunnerState, []string) {
 	var ephemeralRunnerState ephemeralRunnerState
+	var invalidPatchIDs []string
 
 	for i := range ephemeralRunnerList.Items {
 		r := &ephemeralRunnerList.Items[i]
-		patchID, err := strconv.Atoi(r.Annotations[AnnotationKeyPatchID])
-		if err == nil && patchID > ephemeralRunnerState.latestPatchID {
-			ephemeralRunnerState.latestPatchID = patchID
+		if patchIDStr, exists := r.Annotations[AnnotationKeyPatchID]; exists {
+			patchID, err := strconv.Atoi(patchIDStr)
+			if err == nil && patchID > ephemeralRunnerState.latestPatchID {
+				ephemeralRunnerState.latestPatchID = patchID
+			} else if err != nil {
+				// Collect invalid PatchIDs to report back to caller for logging
+				invalidPatchIDs = append(invalidPatchIDs, fmt.Sprintf("runner %s has invalid PatchID: %s", r.Name, patchIDStr))
+			}
 		}
 		if !r.DeletionTimestamp.IsZero() {
 			ephemeralRunnerState.deleting = append(ephemeralRunnerState.deleting, r)
@@ -594,7 +625,7 @@ func newEphemeralRunnerState(ephemeralRunnerList *v1alpha1.EphemeralRunnerList) 
 			ephemeralRunnerState.pending = append(ephemeralRunnerState.pending, r)
 		}
 	}
-	return &ephemeralRunnerState
+	return &ephemeralRunnerState, invalidPatchIDs
 }
 
 func (s *ephemeralRunnerState) scaleTotal() int {

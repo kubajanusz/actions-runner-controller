@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
 	"github.com/actions/actions-runner-controller/cmd/ghalistener/listener"
@@ -43,6 +44,7 @@ type Worker struct {
 	lastPatch int
 	patchSeq  int
 	logger    *logr.Logger
+	mutex     sync.Mutex // Add mutex for thread safety
 }
 
 var _ listener.Handler = (*Worker)(nil)
@@ -164,6 +166,13 @@ func (w *Worker) HandleJobStarted(ctx context.Context, jobInfo *actions.JobStart
 // Finally, it logs the scaled ephemeral runner set details and returns nil if successful.
 // If any error occurs during the process, it returns an error with a descriptive message.
 func (w *Worker) HandleDesiredRunnerCount(ctx context.Context, count, jobsCompleted int) (int, error) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	// Store old state for rollback on failure
+	oldLastPatch := w.lastPatch
+	oldPatchSeq := w.patchSeq
+
 	patchID := w.setDesiredWorkerState(count, jobsCompleted)
 
 	original, err := json.Marshal(
@@ -197,7 +206,12 @@ func (w *Worker) HandleDesiredRunnerCount(ctx context.Context, count, jobsComple
 		return 0, fmt.Errorf("failed to create merge patch json for ephemeral runner set: %w", err)
 	}
 
-	w.logger.Info("Preparing EphemeralRunnerSet update", "json", string(mergePatch))
+	w.logger.Info("Preparing EphemeralRunnerSet update", 
+		"json", string(mergePatch),
+		"patchID", patchID,
+		"targetRunnerCount", w.lastPatch,
+		"count", count,
+		"jobsCompleted", jobsCompleted)
 
 	patchedEphemeralRunnerSet := &v1alpha1.EphemeralRunnerSet{}
 	err = w.clientset.RESTClient().
@@ -210,6 +224,9 @@ func (w *Worker) HandleDesiredRunnerCount(ctx context.Context, count, jobsComple
 		Do(ctx).
 		Into(patchedEphemeralRunnerSet)
 	if err != nil {
+		// Rollback state on failure
+		w.lastPatch = oldLastPatch
+		w.patchSeq = oldPatchSeq
 		return 0, fmt.Errorf("could not patch ephemeral runner set , patch JSON: %s, error: %w", string(mergePatch), err)
 	}
 
@@ -226,6 +243,11 @@ func (w *Worker) setDesiredWorkerState(count, jobsCompleted int) int {
 	// Max runners should always be set by the resource builder either to the configured value,
 	// or the maximum int32 (resourcebuilder.newAutoScalingListener()).
 	targetRunnerCount := min(w.config.MinRunners+count, w.config.MaxRunners)
+	
+	// Store old values for logging
+	oldPatchSeq := w.patchSeq
+	oldLastPatch := w.lastPatch
+	
 	w.patchSeq++
 	desiredPatchID := w.patchSeq
 
@@ -237,6 +259,7 @@ func (w *Worker) setDesiredWorkerState(count, jobsCompleted int) int {
 			// If controller created few more pods on accident (during scale down events),
 			// this situation allows the controller to scale down to the min runners.
 			// However, it is important to keep the patch sequence increasing so we don't ignore one batch.
+			// Keep the existing behavior: set desiredPatchID to 0 but keep sequence incremented
 			desiredPatchID = 0
 		}
 	}
@@ -251,6 +274,11 @@ func (w *Worker) setDesiredWorkerState(count, jobsCompleted int) int {
 		"max", w.config.MaxRunners,
 		"currentRunnerCount", w.lastPatch,
 		"jobsCompleted", jobsCompleted,
+		"oldPatchSeq", oldPatchSeq,
+		"newPatchSeq", w.patchSeq,
+		"desiredPatchID", desiredPatchID,
+		"oldLastPatch", oldLastPatch,
+		"newLastPatch", w.lastPatch,
 	)
 
 	return desiredPatchID
